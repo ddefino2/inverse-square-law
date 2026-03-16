@@ -1,0 +1,294 @@
+
+<style>
+  .row { display:flex; align-items:center; gap:10px; margin:8px 0; font-size:13px; color:var(--color-text-secondary); }
+  .row label { min-width:110px; }
+  .row input[type=range] { flex:1; }
+  .row span.val { min-width:80px; text-align:right; font-size:13px; font-weight:500; color:var(--color-text-primary); }
+  select { background:var(--color-background-secondary); color:var(--color-text-primary); border:0.5px solid var(--color-border-secondary); border-radius:8px; padding:5px 10px; font-size:13px; cursor:pointer; outline:none; }
+  .droprows { display:flex; gap:12px; margin:8px 0 4px; flex-wrap:wrap; }
+  .dropgroup { display:flex; align-items:center; gap:8px; font-size:13px; color:var(--color-text-secondary); }
+  #stats { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin:12px 0 0; }
+  .stat { background:var(--color-background-secondary); border-radius:8px; padding:10px 12px; text-align:center; }
+  .stat-label { font-size:11px; color:var(--color-text-secondary); margin-bottom:4px; }
+  .stat-val { font-size:18px; font-weight:500; color:var(--color-text-primary); }
+  .stat-unit { font-size:11px; color:var(--color-text-secondary); margin-top:2px; }
+</style>
+
+<canvas id="c" style="width:100%;display:block;border-radius:10px;"></canvas>
+
+<div style="padding:6px 0 0;">
+  <div class="droprows">
+    <div class="dropgroup">
+      <label>Unit:</label>
+      <select id="unit">
+        <option value="fc">Foot candles (fc)</option>
+        <option value="lm">Lumens (lm)</option>
+        <option value="fstop">F-stops</option>
+      </select>
+    </div>
+    <div class="dropgroup">
+      <label>Distance:</label>
+      <select id="distunit">
+        <option value="ft">Feet</option>
+        <option value="m">Meters</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="row">
+    <label id="src-label">Source (fc at 1 ft)</label>
+    <input type="range" id="power" min="100" max="5000" step="100" value="1000">
+    <span class="val" id="power-out">1000 fc</span>
+  </div>
+  <div class="row">
+    <label id="dist-label">Distance</label>
+    <input type="range" id="dist" min="1" max="20" step="1" value="5">
+    <span class="val" id="dist-out">5 ft</span>
+  </div>
+</div>
+
+<div id="stats">
+  <div class="stat"><div class="stat-label">Distance</div><div class="stat-val" id="sv-dist">5</div><div class="stat-unit" id="sv-dist-u">feet</div></div>
+  <div class="stat"><div class="stat-label" id="sv-int-label">Illuminance</div><div class="stat-val" id="sv-int">40</div><div class="stat-unit" id="sv-int-u">foot candles</div></div>
+  <div class="stat"><div class="stat-label">vs 1 unit distance</div><div class="stat-val" id="sv-comp">-96%</div><div class="stat-unit" id="sv-comp-u">reduction</div></div>
+</div>
+
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+let dist = 5, power = 1000, unit = 'fc', distunit = 'ft';
+
+// F-stop: base f-stop at 1 unit distance.
+// As distance increases, intensity falls by 1/d², so to maintain exposure
+// you need to open up the aperture. Since intensity ∝ 1/f², the required
+// f-stop scales as: f_new = f_base / d
+// e.g. at d=2, intensity is 1/4 of d=1, so f-stop halves (opens 2 stops).
+function computeValue(sourceVal, d) {
+  if (unit === 'fstop') {
+    // f_at_distance = f_base / d  (smaller f = more open = compensates for falloff)
+    return Math.max(0.5, sourceVal / d);
+  }
+  return sourceVal / (d * d);
+}
+
+function normForColor(sourceVal, d) {
+  if (unit === 'fstop') {
+    // brightness ∝ 1/f² ∝ d² / f_base², normalised to d=1
+    return Math.min(1, 1 / (d * d));
+  }
+  return Math.min(1, 1 / (d * d));
+}
+
+const unitConfig = {
+  fc:    { label: () => `Source (fc at 1 ${distunit === 'ft' ? 'ft' : 'm'})`, min:100, max:5000, step:100, def:1000, statLabel:'Illuminance',    unitLong:'foot candles', fmt: v => v >= 10 ? Math.round(v).toLocaleString() : v.toFixed(2), suffix:'fc',  formula:'E = S / d²' },
+  lm:    { label: () => `Source luminous flux`,                                min:100, max:10000,step:100, def:2000, statLabel:'Luminous flux',   unitLong:'lumens',       fmt: v => v >= 10 ? Math.round(v).toLocaleString() : v.toFixed(2), suffix:'lm',  formula:'Φ ∝ 1 / d²' },
+  fstop: { label: () => `Base f-stop (at 1 ${distunit === 'ft' ? 'ft' : 'm'})`,min:1,  max:16,   step:0.5, def:8,    statLabel:'Required f-stop', unitLong:'aperture',     fmt: v => 'f/' + v.toFixed(1),                                   suffix:'',    formula:'f-stop needed = f_base / d' },
+};
+
+const distConfig = {
+  ft: { label:'Distance', min:1, max:20, step:1, def:5, suffix:'ft', unitLong:'feet'   },
+  m:  { label:'Distance', min:1, max:20, step:1, def:5, suffix:'m',  unitLong:'meters' },
+};
+
+function getColors() {
+  const dark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+  return {
+    bg: dark ? '#1a1a18' : '#f5f4f0',
+    text: dark ? '#c2c0b6' : '#5f5e5a',
+    textPrimary: dark ? '#e8e6de' : '#2c2c2a',
+    arc: dark ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.04)',
+    surfaceA: dark ? '#3d3d3a' : '#d3d1c7',
+  };
+}
+
+function intensityColor(t) {
+  const r = Math.round(220 + 35*t);
+  const g = Math.round(90 + 80*(1-t)*t*4);
+  const b = 30;
+  return `rgba(${r},${g},${b},${0.1 + 0.9*t})`;
+}
+
+function fmtVal(val) {
+  return unitConfig[unit].fmt(val);
+}
+
+function draw() {
+  const dpr = window.devicePixelRatio || 1;
+  const W = canvas.width / dpr;
+  const H = canvas.height / dpr;
+  const C = getColors();
+
+  ctx.save();
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0,0,W,H);
+  ctx.fillStyle = C.bg;
+  ctx.beginPath();
+  ctx.roundRect(0,0,W,H,12);
+  ctx.fill();
+
+  const srcX = 70, cy = H/2;
+  const maxReach = W - 30;
+  const maxD = distConfig[distunit].max;
+
+  // Wavefront arcs
+  for (let d = 2; d <= maxD; d += 2) {
+    const x = srcX + (d / maxD) * (maxReach - srcX);
+    ctx.beginPath();
+    ctx.arc(srcX, cy, x - srcX, -Math.PI*0.45, Math.PI*0.45);
+    ctx.strokeStyle = C.arc;
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+
+  // Intensity gradient fill (always shows physical light falloff)
+  const numSlices = 160;
+  for (let i = 0; i < numSlices; i++) {
+    const px = srcX + (i / numSlices) * (maxReach - srcX);
+    const fracDist = Math.max(0.1, (i / numSlices) * maxD);
+    const norm = normForColor(power, fracDist);
+    const height = (fracDist / maxD) * H * 0.85;
+    const sliceW = (maxReach - srcX) / numSlices + 1;
+    ctx.fillStyle = intensityColor(norm);
+    ctx.fillRect(px, cy - height/2, sliceW, height);
+  }
+
+  // Axis
+  ctx.strokeStyle = C.text;
+  ctx.lineWidth = 0.5;
+  ctx.setLineDash([4,4]);
+  ctx.beginPath();
+  ctx.moveTo(srcX, cy);
+  ctx.lineTo(maxReach, cy);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Markers
+  const markers = [1, 2, 4, 6, 10, 15, 20];
+  markers.forEach(d => {
+    const x = srcX + (d / maxD) * (maxReach - srcX);
+    const val = computeValue(power, d);
+    const ht = (d / maxD) * H * 0.85;
+
+    ctx.fillStyle = d === dist ? 'rgba(180,130,60,0.55)' : C.surfaceA;
+    ctx.beginPath();
+    ctx.roundRect(x - 3, cy - ht/2, 6, ht, 2);
+    ctx.fill();
+
+    ctx.fillStyle = C.textPrimary;
+    ctx.font = `500 10px var(--font-sans, sans-serif)`;
+    ctx.textAlign = 'center';
+    ctx.fillText(fmtVal(val), x, cy - ht/2 - 7);
+
+    ctx.fillStyle = C.text;
+    ctx.font = `400 10px var(--font-sans, sans-serif)`;
+    ctx.fillText(d + ' ' + distConfig[distunit].suffix, x, cy + ht/2 + 14);
+  });
+
+  // Current distance marker
+  const curX = srcX + (dist / maxD) * (maxReach - srcX);
+  const curHt = (dist / maxD) * H * 0.85;
+  ctx.strokeStyle = '#E8593C';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(curX, cy - curHt/2 - 2);
+  ctx.lineTo(curX, cy + curHt/2 + 2);
+  ctx.stroke();
+
+  // Formula
+  ctx.fillStyle = C.textPrimary;
+  ctx.font = `500 12px var(--font-sans, sans-serif)`;
+  ctx.textAlign = 'left';
+  ctx.fillText(unitConfig[unit].formula, srcX + 4, 20);
+
+  // Source glow
+  const grd = ctx.createRadialGradient(srcX, cy, 0, srcX, cy, 30);
+  grd.addColorStop(0, 'rgba(255,220,80,0.95)');
+  grd.addColorStop(0.4, 'rgba(255,160,40,0.7)');
+  grd.addColorStop(1, 'rgba(255,100,20,0)');
+  ctx.fillStyle = grd;
+  ctx.beginPath();
+  ctx.arc(srcX, cy, 30, 0, Math.PI*2);
+  ctx.fill();
+  ctx.fillStyle = '#fff';
+  ctx.beginPath();
+  ctx.arc(srcX, cy, 5, 0, Math.PI*2);
+  ctx.fill();
+  ctx.fillStyle = C.text;
+  ctx.font = `400 10px var(--font-sans, sans-serif)`;
+  ctx.textAlign = 'center';
+  ctx.fillText('source', srcX, cy + 18);
+
+  ctx.restore();
+
+  // Stats
+  const valAtDist = computeValue(power, dist);
+  const valAt1    = computeValue(power, 1);
+  document.getElementById('sv-dist').textContent = dist;
+  document.getElementById('sv-dist-u').textContent = distConfig[distunit].unitLong;
+  document.getElementById('sv-int-label').textContent = unitConfig[unit].statLabel;
+
+  if (unit === 'fstop') {
+    document.getElementById('sv-int').textContent = 'f/' + valAtDist.toFixed(1);
+    document.getElementById('sv-int-u').textContent = 'aperture needed';
+    // stops gained (opening up) = log2(f_base / f_new) = log2(d)
+    const stopsGained = Math.log2(dist);
+    document.getElementById('sv-comp').textContent = stopsGained >= 0 ? '+' + stopsGained.toFixed(1) : stopsGained.toFixed(1);
+    document.getElementById('sv-comp-u').textContent = 'stops opened up';
+  } else {
+    const uc = unitConfig[unit];
+    document.getElementById('sv-int').textContent = uc.fmt(valAtDist);
+    document.getElementById('sv-int-u').textContent = uc.unitLong;
+    const reduction = Math.round((1 - valAtDist / power) * 100);
+    document.getElementById('sv-comp').textContent = '-' + reduction + '%';
+    document.getElementById('sv-comp-u').textContent = 'reduction';
+  }
+}
+
+function updateControls() {
+  const uc = unitConfig[unit];
+  const dc = distConfig[distunit];
+
+  const pSlider = document.getElementById('power');
+  pSlider.min = uc.min; pSlider.max = uc.max; pSlider.step = uc.step;
+  power = uc.def; pSlider.value = power;
+
+  const dSlider = document.getElementById('dist');
+  dSlider.min = dc.min; dSlider.max = dc.max; dSlider.step = dc.step;
+  dist = dc.def; dSlider.value = dist;
+
+  document.getElementById('src-label').textContent = uc.label();
+  document.getElementById('dist-label').textContent = dc.label;
+  document.getElementById('power-out').textContent = unit === 'fstop' ? 'f/' + power.toFixed(1) : power.toLocaleString() + ' ' + uc.suffix;
+  document.getElementById('dist-out').textContent = dist + ' ' + dc.suffix;
+
+  draw();
+}
+
+document.getElementById('unit').addEventListener('change', e => { unit = e.target.value; updateControls(); });
+document.getElementById('distunit').addEventListener('change', e => { distunit = e.target.value; updateControls(); });
+
+document.getElementById('power').addEventListener('input', e => {
+  power = parseFloat(e.target.value);
+  const uc = unitConfig[unit];
+  document.getElementById('power-out').textContent = unit === 'fstop' ? 'f/' + power.toFixed(1) : power.toLocaleString() + ' ' + uc.suffix;
+  draw();
+});
+
+document.getElementById('dist').addEventListener('input', e => {
+  dist = parseInt(e.target.value);
+  document.getElementById('dist-out').textContent = dist + ' ' + distConfig[distunit].suffix;
+  draw();
+});
+
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.parentElement.clientWidth;
+  const h = Math.round(w * 0.45);
+  canvas.width = w * dpr; canvas.height = h * dpr; canvas.style.height = h + 'px';
+  draw();
+}
+
+window.addEventListener('resize', resize);
+resize();
+</script>
